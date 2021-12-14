@@ -31,6 +31,11 @@ limitations under the License.
 #include "mlir/IR/PatternMatch.h"  // from @llvm-project
 #include "mlir/Support/LLVM.h"  // from @llvm-project
 #include "mlir/Transforms/DialectConversion.h"  // from @llvm-project
+#include "mlir/Dialect/Tosa/IR/TosaOps.h"
+#include "mlir/Dialect/Traits.h"
+#include "mlir/IR/Matchers.h"
+#include "mlir/Transforms/DialectConversion.h"
+
 #include "tensorflow/compiler/mlir/lite/ir/tfl_ops.h"
 #include "tensorflow/compiler/mlir/tosa/transforms/legalize_common.h"
 #include "tensorflow/compiler/mlir/tosa/transforms/legalize_utils.h"
@@ -39,16 +44,6 @@ limitations under the License.
 #define PASS_NAME "tosa-legalize-tfl"
 #define DEBUG_TYPE PASS_NAME
 #define HARDSWISH_EXPLICIT_RESCALING false
-
-// Conditionally avoid converting some TFLite ops to TOSA.
-// By default, all conversions will be invoked.
-//
-// The denylist file lists patterns which are not legalized from TFLite to TOSA.
-llvm::cl::opt<std::string> tfl_tosa_denylist(
-    "tfl-tosa-denylist",
-    llvm::cl::desc("<a list of patterns not legalized from TFLite to TOSA>"),
-    llvm::cl::init("transforms/tfl_tosa_denylist.txt"),
-    llvm::cl::value_desc("pattern name"));
 
 namespace mlir {
 namespace tosa {
@@ -61,9 +56,20 @@ class LegalizeTFL : public TosaLegalizeTFLPassBase<LegalizeTFL> {
  public:
   explicit LegalizeTFL() {}
   void runOnFunction() override;
+  std::unordered_map<std::string, bool> legalization_enable;
 };
 
 #include "tensorflow/compiler/mlir/tosa/transforms/tfl_legalize_patterns.inc"
+
+// Input from tfl.conv2d takes 64 bits a bias, while tosa.conv2d expects 48
+// bits. Need to do a customized truncate here instead of tablegen to handle
+// attribute with negative value.
+struct ConvertConstantOp : public RewritePattern {
+  explicit ConvertConstantOp(MLIRContext* context)
+      : RewritePattern(arith::ConstantOp::getOperationName(), 1, context) {}
+  LogicalResult matchAndRewrite(Operation* op,
+                                PatternRewriter& rewriter) const override;
+};
 
 #define DECL_CONVERT_OP(tfl_op)                                              \
   struct ConvertTFL##tfl_op##Op : public RewritePattern {                    \
@@ -155,18 +161,8 @@ DECL_CONVERT_OP(SparseToDense);
 DECL_CONVERT_OP(OneHot);
 DECL_CONVERT_OP(ArgMax);
 DECL_CONVERT_OP(FakeQuant);
+
 #undef DECL_CONVERT_OP
-
-// Input from tfl.conv2d takes 64 bits a bias, while tosa.conv2d expects 48
-// bits. Need to do a customized truncate here instead of tablegen to handle
-// attribute with negative value.
-
-struct ConvertConstantOp : public RewritePattern {
-  explicit ConvertConstantOp(MLIRContext* context)
-      : RewritePattern(arith::ConstantOp::getOperationName(), 1, context) {}
-  LogicalResult matchAndRewrite(Operation* op,
-                                PatternRewriter& rewriter) const override;
-};
 
 LogicalResult ConvertTFLReluOp::matchAndRewrite(
     Operation* op, PatternRewriter& rewriter) const {
@@ -3095,110 +3091,206 @@ LogicalResult ConvertTFLFakeQuantOp::matchAndRewrite(
 
 void LegalizeTFL::runOnFunction() {
   OwningRewritePatternList patterns(&getContext());
-  populateLegalizeTFLPatterns(&getContext(), patterns);
+  populateLegalizeTFLPatterns(&getContext(), patterns, legalization_enable);
 
   auto func = getFunction();
   if (ApplyPatternsWithShapeResolution(func, std::move(patterns)).failed()) {
     signalPassFailure();
   }
 }
+
+template <typename TFLOpT, typename TosaOpT>
+class ConvertTFLUnaryOp : public OpConversionPattern<TFLOpT> {
+public:
+  using OpConversionPattern<TFLOpT>::OpConversionPattern;
+  using OpAdaptor = typename TFLOpT::Adaptor;
+  LogicalResult matchAndRewrite(
+    TFLOpT op, OpAdaptor adaptor,
+    ConversionPatternRewriter &rewriter) const {
+      rewriter.replaceOpWithNewOp<TosaOpT>(
+         op, op.getType(), adaptor.getOperands()[0]);
+      return success();
+  }
+};
+
+template <typename TFLOpT, typename TosaOpT>
+class ConvertTFLBinaryOp : public OpConversionPattern<TFLOpT> {
+public:
+  using OpConversionPattern<TFLOpT>::OpConversionPattern;
+  using OpAdaptor = typename TFLOpT::Adaptor;
+  LogicalResult matchAndRewrite(
+    TFLOpT op, OpAdaptor adaptor,
+    ConversionPatternRewriter &rewriter) const {
+      rewriter.replaceOpWithNewOp<TosaOpT>(
+         op, op.getType(), adaptor.getOperands()[0], adaptor.getOperands()[1]);
+      return success();
+  }
+};
+
 }  // namespace
 
 void populateLegalizeTFLPatterns(MLIRContext* ctx,
-                                 RewritePatternSet& patterns) {
-  // Add the generated patterns to the list.
+                                 RewritePatternSet& patterns,
+                                 std::unordered_map<std::string, bool> legalization_enable) {
+  #define DEF_PATTERN_INSERT(PAT) patterns.insert<Convert##PAT##Op>(ctx);
+  #define DEF_PATTERN_INSERT_UNARY(PAT) patterns.insert<ConvertTFLUnaryOp<TFL::PAT##Op, tosa::PAT##Op>>(ctx);
+  #define DEF_PATTERN_INSERT_BINARY(PAT) patterns.insert<ConvertTFLBinaryOp<TFL::PAT##Op, tosa::PAT##Op>>(ctx);
+
+  /*
+    0. If the legalization_enable map is empty than we add all rewrites
+    1. If there is an entry for the Op in a non empty legalization_enable map
+       than we add/skip the rewrite accordingly
+    2. If there is no entry for the Op in a non empty legalization_enable map
+       than we add the rewrite
+   */
+
+  #define DEF_FUNCTION(PAT)                                                    \
+     if (legalization_enable.size() == 0) {                                    \
+       DEF_PATTERN_INSERT(PAT);                                                \
+     }                                                                         \
+     auto it##PAT = legalization_enable.find(#PAT);                            \
+     if (it##PAT != legalization_enable.end())                                 \
+     {                                                                         \
+       if (it##PAT->second)                                                    \
+         DEF_PATTERN_INSERT(PAT);                                              \
+     }                                                                         \
+     if (it##PAT == legalization_enable.end())                                 \
+       DEF_PATTERN_INSERT(PAT);
+
+  #define DEF_FUNCTION_UNARY(PAT)                                              \
+     if (legalization_enable.size() == 0) {                                    \
+       DEF_PATTERN_INSERT_UNARY(PAT);                                          \
+     }                                                                         \
+     auto it##PAT = legalization_enable.find(#PAT);                            \
+     if (it##PAT != legalization_enable.end())                                 \
+     {                                                                         \
+       if (it##PAT->second)                                                    \
+         DEF_PATTERN_INSERT_UNARY(PAT);                                        \
+     }                                                                         \
+     if (it##PAT == legalization_enable.end())                                 \
+       DEF_PATTERN_INSERT_UNARY(PAT);
+
+  #define DEF_FUNCTION_BINARY(PAT)                                             \
+     if (legalization_enable.size() == 0) {                                    \
+       DEF_PATTERN_INSERT_BINARY(PAT);                                         \
+     }                                                                         \
+     auto it##PAT = legalization_enable.find(#PAT);                            \
+     if (it##PAT != legalization_enable.end())                                 \
+     {                                                                         \
+       if (it##PAT->second)                                                    \
+         DEF_PATTERN_INSERT_BINARY(PAT);                                       \
+     }                                                                         \
+     if (it##PAT == legalization_enable.end())                                 \
+       DEF_PATTERN_INSERT_BINARY(PAT);
+
+  DEF_FUNCTION_UNARY(Abs);
+  DEF_FUNCTION_UNARY(Ceil);
+  DEF_FUNCTION_UNARY(Floor);
+  DEF_FUNCTION_UNARY(Exp);
+  DEF_FUNCTION_UNARY(Log);
+  DEF_FUNCTION_UNARY(Rsqrt);
+  DEF_FUNCTION_UNARY(LogicalNot);
+  DEF_FUNCTION_UNARY(Cast);
+
   populateWithGenerated(patterns);
 
-#define DEF_PATTERN_INSERT(PAT) patterns.insert<Convert##PAT##Op>(ctx);
-  DEF_PATTERN_INSERT(TFLRelu);
-  DEF_PATTERN_INSERT(TFLRelu6);
-  DEF_PATTERN_INSERT(TFLEqual);
-  DEF_PATTERN_INSERT(TFLNotEqual);
-  DEF_PATTERN_INSERT(TFLGreater);
-  DEF_PATTERN_INSERT(TFLGreaterEqual);
-  DEF_PATTERN_INSERT(TFLAdd);
-  DEF_PATTERN_INSERT(TFLSub);
-  DEF_PATTERN_INSERT(TFLMul);
-  DEF_PATTERN_INSERT(TFLSquare);
-  DEF_PATTERN_INSERT(TFLSquaredDifference);
-  DEF_PATTERN_INSERT(TFLDiv);
-  DEF_PATTERN_INSERT(TFLMaximum);
-  DEF_PATTERN_INSERT(TFLMinimum);
-  DEF_PATTERN_INSERT(TFLFloorMod);
-  DEF_PATTERN_INSERT(TFLFloorDiv);
-  DEF_PATTERN_INSERT(TFLAddN);
-  DEF_PATTERN_INSERT(TFLAveragePool2D);
-  DEF_PATTERN_INSERT(TFLMaxPool2D);
-  DEF_PATTERN_INSERT(TFLConcatenation);
-  DEF_PATTERN_INSERT(TFLReshape);
-  DEF_PATTERN_INSERT(TFLRank);
-  DEF_PATTERN_INSERT(TFLShape);
-  DEF_PATTERN_INSERT(TFLExpandDims);
-  DEF_PATTERN_INSERT(TFLSqueeze);
-  DEF_PATTERN_INSERT(TFLFill);
-  DEF_PATTERN_INSERT(TFLElu);
-  DEF_PATTERN_INSERT(TFLSoftmax);
-  DEF_PATTERN_INSERT(TFLLogSoftmax);
-  DEF_PATTERN_INSERT(TFLSqrt);
-  DEF_PATTERN_INSERT(TFLL2Normalization);
-  DEF_PATTERN_INSERT(TFLReduceAny);
-  DEF_PATTERN_INSERT(TFLReduceMax);
-  DEF_PATTERN_INSERT(TFLReduceMin);
-  DEF_PATTERN_INSERT(TFLMean);
-  DEF_PATTERN_INSERT(TFLReduceProd);
-  DEF_PATTERN_INSERT(TFLSum);
-  DEF_PATTERN_INSERT(TFLConv2D);
-  DEF_PATTERN_INSERT(TFLTransposeConv);
-  DEF_PATTERN_INSERT(TFLDepthwiseConv2D);
-  DEF_PATTERN_INSERT(TFLFullyConnected);
-  DEF_PATTERN_INSERT(TFLBatchMatMul);
-  DEF_PATTERN_INSERT(TFLSplit);
-  DEF_PATTERN_INSERT(TFLSplitV);
-  DEF_PATTERN_INSERT(TFLPack);
-  DEF_PATTERN_INSERT(TFLUnpack);
-  DEF_PATTERN_INSERT(TFLTranspose);
-  DEF_PATTERN_INSERT(TFLTile);
-  DEF_PATTERN_INSERT(TFLSlice);
-  DEF_PATTERN_INSERT(TFLStridedSlice);
-  DEF_PATTERN_INSERT(TFLZerosLike);
-  DEF_PATTERN_INSERT(TFLHardSwish);
-  DEF_PATTERN_INSERT(TFLLess);
-  DEF_PATTERN_INSERT(TFLLessEqual);
-  DEF_PATTERN_INSERT(TFLPad);
-  DEF_PATTERN_INSERT(TFLPadV2);
-  DEF_PATTERN_INSERT(TFLResizeBilinear);
-  DEF_PATTERN_INSERT(TFLResizeNearestNeighbor);
-  DEF_PATTERN_INSERT(TFLSelect);
-  DEF_PATTERN_INSERT(TFLSelectV2);
-  DEF_PATTERN_INSERT(TFLSpaceToBatchNd);
-  DEF_PATTERN_INSERT(TFLBatchToSpaceNd);
-  DEF_PATTERN_INSERT(TFLSpaceToDepth);
-  DEF_PATTERN_INSERT(TFLDepthToSpace);
-  DEF_PATTERN_INSERT(TFLLogistic);
-  DEF_PATTERN_INSERT(TFLTanh);
-  DEF_PATTERN_INSERT(TFLPRelu);
-  DEF_PATTERN_INSERT(TFLLeakyRelu);
-  DEF_PATTERN_INSERT(TFLNeg);
-  DEF_PATTERN_INSERT(TFLYield);
-  DEF_PATTERN_INSERT(TFLCustom);
-  DEF_PATTERN_INSERT(TFLReverseV2);
-  DEF_PATTERN_INSERT(TFLQuantize);
-  DEF_PATTERN_INSERT(TFLDequantize);
-  DEF_PATTERN_INSERT(TFLConst);
-  DEF_PATTERN_INSERT(TFLQConst);
-  DEF_PATTERN_INSERT(Constant);
-  DEF_PATTERN_INSERT(TFLGather);
-  DEF_PATTERN_INSERT(TFLGatherNd);
-  DEF_PATTERN_INSERT(TFLSparseToDense);
-  DEF_PATTERN_INSERT(TFLArgMax);
-  DEF_PATTERN_INSERT(TFLFakeQuant);
-  DEF_PATTERN_INSERT(TFLOneHot);
-#undef DEF_PATTERN_INSERT
+  DEF_FUNCTION_BINARY(LogicalAnd);
+  DEF_FUNCTION_BINARY(LogicalOr);
+  DEF_FUNCTION_BINARY(Pow);
+
+  DEF_FUNCTION(TFLRelu);
+  DEF_FUNCTION(TFLRelu6);
+  DEF_FUNCTION(TFLEqual);
+  DEF_FUNCTION(TFLNotEqual);
+  DEF_FUNCTION(TFLGreater);
+  DEF_FUNCTION(TFLGreaterEqual);
+  DEF_FUNCTION(TFLAdd);
+  DEF_FUNCTION(TFLSub);
+  DEF_FUNCTION(TFLMul);
+  DEF_FUNCTION(TFLSquare);
+  DEF_FUNCTION(TFLSquaredDifference);
+  DEF_FUNCTION(TFLRound);
+  DEF_FUNCTION(TFLDiv);
+  DEF_FUNCTION(TFLMaximum);
+  DEF_FUNCTION(TFLMinimum);
+  DEF_FUNCTION(TFLFloorMod);
+  DEF_FUNCTION(TFLFloorDiv);
+  DEF_FUNCTION(TFLAddN);
+  DEF_FUNCTION(TFLAveragePool2D);
+  DEF_FUNCTION(TFLMaxPool2D);
+  DEF_FUNCTION(TFLConcatenation);
+  DEF_FUNCTION(TFLReshape);
+  DEF_FUNCTION(TFLRank);
+  DEF_FUNCTION(TFLShape);
+  DEF_FUNCTION(TFLExpandDims);
+  DEF_FUNCTION(TFLSqueeze);
+  DEF_FUNCTION(TFLFill);
+  DEF_FUNCTION(TFLElu);
+  DEF_FUNCTION(TFLSoftmax);
+  DEF_FUNCTION(TFLLogSoftmax);
+  DEF_FUNCTION(TFLSqrt);
+  DEF_FUNCTION(TFLL2Normalization);
+  DEF_FUNCTION(TFLReduceAny);
+  DEF_FUNCTION(TFLReduceMax);
+  DEF_FUNCTION(TFLReduceMin);
+  DEF_FUNCTION(TFLMean);
+  DEF_FUNCTION(TFLReduceProd);
+  DEF_FUNCTION(TFLSum);
+  DEF_FUNCTION(TFLConv2D);
+  DEF_FUNCTION(TFLTransposeConv);
+  DEF_FUNCTION(TFLDepthwiseConv2D);
+  DEF_FUNCTION(TFLFullyConnected);
+  DEF_FUNCTION(TFLBatchMatMul);
+  DEF_FUNCTION(TFLSplit);
+  DEF_FUNCTION(TFLSplitV);
+  DEF_FUNCTION(TFLPack);
+  DEF_FUNCTION(TFLUnpack);
+  DEF_FUNCTION(TFLTranspose);
+  DEF_FUNCTION(TFLTile);
+  DEF_FUNCTION(TFLSlice);
+  DEF_FUNCTION(TFLStridedSlice);
+  DEF_FUNCTION(TFLHardSwish);
+  DEF_FUNCTION(TFLZerosLike);
+  DEF_FUNCTION(TFLLess);
+  DEF_FUNCTION(TFLLessEqual);
+  DEF_FUNCTION(TFLPad);
+  DEF_FUNCTION(TFLPadV2);
+  DEF_FUNCTION(TFLResizeBilinear);
+  DEF_FUNCTION(TFLResizeNearestNeighbor);
+  DEF_FUNCTION(TFLSelect);
+  DEF_FUNCTION(TFLSelectV2);
+  DEF_FUNCTION(TFLSpaceToBatchNd);
+  DEF_FUNCTION(TFLBatchToSpaceNd);
+  DEF_FUNCTION(TFLSpaceToDepth);
+  DEF_FUNCTION(TFLDepthToSpace);
+  DEF_FUNCTION(TFLLogistic);
+  DEF_FUNCTION(TFLTanh);
+  DEF_FUNCTION(TFLPRelu);
+  DEF_FUNCTION(TFLLeakyRelu);
+  DEF_FUNCTION(TFLNeg);
+  DEF_FUNCTION(TFLYield);
+  DEF_FUNCTION(TFLCustom);
+  DEF_FUNCTION(TFLReverseV2);
+  DEF_FUNCTION(TFLQuantize);
+  DEF_FUNCTION(TFLDequantize);
+  DEF_FUNCTION(TFLConst);
+  DEF_FUNCTION(TFLQConst);
+  DEF_FUNCTION(TFLGather);
+  DEF_FUNCTION(TFLGatherNd);
+  DEF_FUNCTION(TFLSparseToDense);
+  DEF_FUNCTION(Constant);
+  DEF_FUNCTION(TFLOneHot);
+  DEF_FUNCTION(TFLArgMax);
+  DEF_FUNCTION(TFLFakeQuant);
 }
 
 // Creates an instance of the TensorFlow Lite dialect LegalizeTFL pass.
-std::unique_ptr<OperationPass<FuncOp>> createLegalizeTFLPass() {
-  return std::make_unique<LegalizeTFL>();
+std::unique_ptr<OperationPass<FuncOp>> createLegalizeTFLPass(
+  std::unordered_map<std::string, bool> legalization_enable)
+{
+  auto p = std::make_unique<LegalizeTFL>();
+  p->legalization_enable = legalization_enable;
+  return p;
 }
 
 }  // namespace tosa
